@@ -1,0 +1,176 @@
+# Install packages
+!pip install transformers biopython scikit-learn tqdm --quiet
+
+# Imports
+import os
+import glob
+import torch
+import pickle
+import numpy as np
+import pandas as pd
+
+from tqdm import tqdm
+from Bio import SeqIO
+from sklearn.preprocessing import LabelEncoder
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import classification_report
+from sklearn.linear_model import SGDClassifier
+from google.colab import files
+files.upload()
+
+# Define batching functions
+def process_save_batches(df, embedding_dict, batch_size=100000, prefix="train"):
+    X_batch, y_batch = [], []
+    total_saved = 0
+    for i, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc=f"Batching {prefix}")): #(w/ progress bar so i don't go crazy waiting)
+        key = (row["protein_id"], row["residue_index"])
+        if key in embedding_dict:
+            X_batch.append(embedding_dict[key])
+            y_batch.append(row["secondary_structure"])
+        if len(X_batch) == batch_size:
+            save_batch(X_batch, y_batch, total_saved, prefix)
+            total_saved += batch_size
+            X_batch, y_batch = [], []
+    if X_batch:
+        save_batch(X_batch, y_batch, total_saved, prefix)
+
+def save_batch(X, y, index, prefix):
+    np.save(f"{prefix}_X_{index}.npy", np.array(X))
+    np.save(f"{prefix}_y_{index}.npy", np.array(y))
+
+# Load data
+train_df = pd.read_csv("train.tsv", sep='\t')
+test_df = pd.read_csv("test.tsv", sep='\t')
+
+def parse_id_fields(df):
+    id_parts = df['id'].str.split('_', expand=True)
+    df['protein_id'] = id_parts[0]
+    df['residue_index'] = id_parts[2].astype(int)
+
+parse_id_fields(train_df)
+parse_id_fields(test_df)
+
+# Load sequences
+seq_dict = {}
+for record in SeqIO.parse("sequences.fasta", "fasta"):
+    seq_dict[record.id.strip()] = str(record.seq)
+
+# Load or compute embeddings
+embedding_cache_file = "esm_embeddings.pkl"
+model_name = "facebook/esm2_t6_8M_UR50D"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name).to(device)
+
+if os.path.exists(embedding_cache_file):
+    with open(embedding_cache_file, "rb") as f:
+        embedding_dict = pickle.load(f)
+    print("Cached embeddings are loaded.")
+else:
+    print("Generating ESM embeddings")
+    embedding_dict = {}
+    for protein_id, sequence in tqdm(seq_dict.items(), desc="Embedding proteins"): #(w/ progress bar so i don't go crazy waiting)
+        inputs = tokenizer(sequence, return_tensors="pt", truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        token_embeddings = outputs.last_hidden_state[0, 1:-1, :]
+        for i, emb in enumerate(token_embeddings):
+            embedding_dict[(protein_id, i + 1)] = emb.cpu().numpy()
+    with open(embedding_cache_file, "wb") as f:
+        pickle.dump(embedding_dict, f)
+    print("Embeddings are saved.")
+
+# Save training data batches
+process_save_batches(train_df, embedding_dict, batch_size=25000, prefix="train")
+
+# Load training batches
+x_batches = sorted(glob.glob("train_X_*.npy"))
+y_batches = sorted(glob.glob("train_y_*.npy"))
+val_X = np.load(x_batches[-1])
+val_y = np.load(y_batches[-1])
+
+label_encoder = LabelEncoder()
+val_y_encoded = label_encoder.fit_transform(val_y)
+
+# Random Forest
+from sklearn.ensemble import RandomForestClassifier
+
+# Load/combine training batches
+X_train, y_train = [], []
+for i in range(len(x_batches) - 1):
+    X = np.load(x_batches[i])
+    y = label_encoder.transform(np.load(y_batches[i]))
+    X_train.append(X)
+    y_train.append(y)
+
+X_train = np.vstack(X_train)
+y_train = np.concatenate(y_train)
+
+from sklearn.ensemble import HistGradientBoostingClassifier
+from tqdm import tqdm
+import numpy as np
+
+# Settings
+n_iter = 100
+clf = HistGradientBoostingClassifier(max_iter=1, warm_start=True)
+
+# Train (w/ progress bar so i don't go crazy waiting)
+for i in tqdm(range(1, n_iter + 1), desc="Training HGB"):
+    clf.set_params(max_iter=i)
+    clf.fit(X_train, y_train)
+
+
+# Evaluate on validation
+val_y_encoded = label_encoder.transform(val_y)
+y_pred = clf.predict(val_X)
+
+from sklearn.metrics import classification_report
+print("\n Validation Performance:")
+print(classification_report(val_y_encoded, y_pred, target_names=label_encoder.classes_))
+
+
+# Batched prediction helper
+def batched_predict(clf, X_val, batch_size=100000):
+    preds = []
+    for i in tqdm(range(0, len(X_val), batch_size), desc="Predicting in batches"): #(w/ progress bar so i don't go crazy waiting)
+        batch = X_val[i:i + batch_size]
+        preds.append(clf.predict(batch))
+    return np.concatenate(preds)
+
+# Validate
+y_pred = batched_predict(clf, val_X)
+print("\n Validation Performance:")
+print(classification_report(val_y_encoded, y_pred, target_names=label_encoder.classes_))
+
+# Predict test set
+predictions = []
+missing = 0
+
+for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Predicting test.tsv"): #(w/ progress bar so i don't go crazy waiting)
+    key = (row["protein_id"], row["residue_index"])
+
+    if key in embedding_dict:
+        # Reshape embedding for prediction
+        embedding = np.array(embedding_dict[key]).reshape(1, -1)
+
+        # Direct prediction
+        pred = clf.predict(embedding)
+
+        # Convert numeric prediction back to label
+        pred_label = label_encoder.inverse_transform(pred)[0]
+        predictions.append(pred_label)
+    else:
+        # If embedding is missing, use placeholder
+        predictions.append('.')
+        missing += 1
+
+print(f"Prediction complete. Missing embeddings: {missing}")
+
+
+# Save predictions
+test_df["prediction"] = predictions
+test_df[["id", "prediction"]].to_csv("predictions.csv", sep="\t", index=False, header=False)
+
+!zip prediction.zip predictions.csv
